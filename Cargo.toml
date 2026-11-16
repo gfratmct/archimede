@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/archimede-core",
+    "crates/archimede-collect",
+    "crates/archimede-features",
+    "crates/archimede-classify",
+    "crates/archimede-forecast",
+    "crates/archimede",
+]
+default-members = ["crates/archimede"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Archimede Contributors"]
+repository = "https://github.com/gabriele/archimede"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+flume = "0.11"
+futures = "0.3"
+hex = "0.4"
+ndarray = "0.16"
+procfs = "0.17"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+sysinfo = "0.33"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+archimede-core = { path = "crates/archimede-core" }
+archimede-collect = { path = "crates/archimede-collect" }
+archimede-features = { path = "crates/archimede-features" }
+archimede-classify = { path = "crates/archimede-classify" }
+archimede-forecast = { path = "crates/archimede-forecast" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

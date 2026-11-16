@@ -1,0 +1,16 @@
+[package]
+name = "archimede-classify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "System-One behavior classification (Jev-compatible HTTP + rule fallback)"
+
+[dependencies]
+anyhow.workspace = true
+archimede-core.workspace = true
+archimede-features.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

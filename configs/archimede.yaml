@@ -1,0 +1,71 @@
+# Archimede local agent awareness configuration
+daemon:
+  poll_interval_ms: 2000
+  bucket_secs: 30
+  data_dir: "~/.local/share/archimede"
+  bind: "127.0.0.1:7432"
+  enable_ebpf: false
+
+attribution:
+  # Process name / cmdline substrings mapped to agent families
+  agents:
+    - name: cursor
+      family: coding_agent
+      match: ["cursor", "Cursor"]
+    - name: claude-code
+      family: coding_agent
+      match: ["claude", "claude-code"]
+    - name: copilot
+      family: coding_agent
+      match: ["copilot", "github-copilot"]
+    - name: openclaw
+      family: harness
+      match: ["openclaw"]
+    - name: hermes
+      family: harness
+      match: ["hermes"]
+    - name: pi
+      family: harness
+      match: ["pi-agent", "pi_agent"]
+    - name: ollama
+      family: local_llm
+      match: ["ollama"]
+    - name: llama-server
+      family: local_llm
+      match: ["llama-server", "llama.cpp"]
+
+session_logs:
+  paths:
+    - "~/.cursor"
+    - "~/.claude"
+    - "~/.config/github-copilot"
+
+classify:
+  endpoint: "http://127.0.0.1:8017/v1/systemone"
+  model: "jev-latest"
+  timeout_ms: 500
+  fallback_rules: true
+  labels:
+    - idle
+    - planning
+    - coding
+    - testing
+    - shell_tools
+    - browsing
+    - llm_wait
+    - risky_egress
+
+forecast:
+  model_size: "5M" # 5M | 28M
+  context_len: 256
+  horizon: 16
+  # Optional ONNX export path for Rust ort inference
+  onnx_path: null
+  # Optional Timestral Python sidecar
+  sidecar_url: null
+
+alerts:
+  egress_bytes_per_bucket: 50000000
+  exec_rate_per_bucket: 40
+  delete_rate_per_bucket: 20
+  risk_score_threshold: 0.7

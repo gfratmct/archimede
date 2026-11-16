@@ -1,0 +1,14 @@
+[package]
+name = "archimede-features"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Feature bucketing and exporters for classification and forecasting"
+
+[dependencies]
+anyhow.workspace = true
+archimede-core.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
