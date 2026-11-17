@@ -1,4 +1,4 @@
-use archimede_core::{Config, Event, EventKind, RiskFlag};
+use archimede_core::{Config, Event, EventKind, RiskFlag, SpanKind};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -22,6 +22,14 @@ pub struct FeatureBucket {
     pub llm_wait_hints: u64,
     pub shell_hints: u64,
     pub coding_hints: u64,
+    pub resource_spikes: u64,
+    pub new_remotes: u64,
+    pub span_count: u64,
+    pub tool_calls: u64,
+    pub llm_calls: u64,
+    pub rss_delta_max: i64,
+    pub cpu_delta_max: f32,
+    pub fd_count_max: u64,
 }
 
 impl FeatureBucket {
@@ -51,13 +59,21 @@ impl FeatureBucket {
             "llm_wait_hints": self.llm_wait_hints,
             "shell_hints": self.shell_hints,
             "coding_hints": self.coding_hints,
+            "resource_spikes": self.resource_spikes,
+            "new_remotes": self.new_remotes,
+            "span_count": self.span_count,
+            "tool_calls": self.tool_calls,
+            "llm_calls": self.llm_calls,
+            "rss_delta_max": self.rss_delta_max,
+            "cpu_delta_max": self.cpu_delta_max,
+            "fd_count_max": self.fd_count_max,
         })
     }
 
     /// Compact textual state for System-One classification.
     pub fn to_state_text(&self) -> String {
         format!(
-            "agent={}; execs={}; binaries={}; writes={}; deletes={}; sockets={}; remotes={}; sessions={}; cpu_max={:.1}; rss_max={}; egress_score={:.2}; llm_wait={}; shell={}; coding={}",
+            "agent={}; execs={}; binaries={}; writes={}; deletes={}; sockets={}; remotes={}; sessions={}; cpu_max={:.1}; rss_max={}; egress_score={:.2}; llm_wait={}; shell={}; coding={}; spikes={}; new_remotes={}; spans={}; tools={}; llms={}",
             self.agent,
             self.exec_count,
             self.unique_binaries.len(),
@@ -72,6 +88,11 @@ impl FeatureBucket {
             self.llm_wait_hints,
             self.shell_hints,
             self.coding_hints,
+            self.resource_spikes,
+            self.new_remotes,
+            self.span_count,
+            self.tool_calls,
+            self.llm_calls,
         )
     }
 
@@ -90,6 +111,11 @@ impl FeatureBucket {
         m.insert("rss_bytes_max".into(), self.rss_bytes_max as f64);
         m.insert("cpu_pct_max".into(), self.cpu_pct_max as f64);
         m.insert("egress_proxy_score".into(), self.egress_proxy_score);
+        m.insert("resource_spikes".into(), self.resource_spikes as f64);
+        m.insert("new_remotes".into(), self.new_remotes as f64);
+        m.insert("span_count".into(), self.span_count as f64);
+        m.insert("tool_calls".into(), self.tool_calls as f64);
+        m.insert("llm_calls".into(), self.llm_calls as f64);
         m
     }
 
@@ -115,7 +141,6 @@ impl FeatureBucket {
                 (self.files_deleted as f32 / cfg.alerts.delete_rate_per_bucket as f32).min(1.0),
             ));
         }
-        // egress_proxy_score approximates volume via remotes * sockets.
         let egress_proxy_bytes = (self.egress_proxy_score * 1_000_000.0) as u64;
         if egress_proxy_bytes >= cfg.alerts.egress_bytes_per_bucket {
             out.push((
@@ -217,7 +242,9 @@ impl BucketAggregator {
             EventKind::Connect { dest, sni, .. } => {
                 b.socket_count += 1;
                 let remote = sni.clone().unwrap_or_else(|| dest.clone());
-                b.distinct_remotes.insert(remote.clone());
+                if b.distinct_remotes.insert(remote.clone()) {
+                    b.new_remotes += 1;
+                }
                 b.egress_proxy_score += 0.5;
                 let lower = remote.to_ascii_lowercase();
                 if lower.contains("openai")
@@ -229,7 +256,9 @@ impl BucketAggregator {
                 }
             }
             EventKind::Dns { query, .. } => {
-                b.distinct_remotes.insert(query.clone());
+                if b.distinct_remotes.insert(query.clone()) {
+                    b.new_remotes += 1;
+                }
                 let lower = query.to_ascii_lowercase();
                 if lower.contains("openai")
                     || lower.contains("anthropic")
@@ -253,6 +282,25 @@ impl BucketAggregator {
                 }
                 if lower.contains("assistant") || lower.contains("thinking") {
                     b.llm_wait_hints += 1;
+                }
+            }
+            EventKind::ResourceDelta(d) => {
+                b.resource_spikes += 1;
+                b.rss_delta_max = b.rss_delta_max.max(d.rss_delta.abs());
+                b.cpu_delta_max = b.cpu_delta_max.max(d.cpu_delta.abs());
+                if let Some(fd) = d.fd_count {
+                    b.fd_count_max = b.fd_count_max.max(fd);
+                }
+            }
+            EventKind::Span(span) => {
+                b.span_count += 1;
+                match span.kind {
+                    SpanKind::Tool => b.tool_calls += 1,
+                    SpanKind::Llm => {
+                        b.llm_calls += 1;
+                        b.llm_wait_hints += 1;
+                    }
+                    _ => {}
                 }
             }
             _ => {}

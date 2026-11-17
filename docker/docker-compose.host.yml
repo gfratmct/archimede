@@ -1,0 +1,39 @@
+# Linux host-observe mode: share host PID + network namespaces so /proc
+# collectors see host agents and sockets.
+#
+# Requires Linux Docker Engine (not Docker Desktop's Linux VM).
+#
+#   docker compose -f docker/docker-compose.host.yml up --build
+#
+# API: http://127.0.0.1:7432 (network_mode: host)
+
+services:
+  archimede:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: archimede:local
+    container_name: archimede
+    restart: unless-stopped
+    pid: host
+    network_mode: host
+    volumes:
+      - archimede-data:/data
+      - ./archimede.yaml:/etc/archimede/archimede.yaml:ro
+      # Optional host session mounts (uncomment as needed):
+      # - ${HOME}/.cursor:/data/session_logs/cursor:ro
+      # - ${HOME}/.claude:/data/session_logs/claude:ro
+      # - ${HOME}/.codex:/data/session_logs/codex:ro
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - apparmor:unconfined
+    healthcheck:
+      test: ["CMD", "archimede", "--config", "/etc/archimede/archimede.yaml", "stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  archimede-data:

@@ -15,10 +15,12 @@ archimede-core.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 flume.workspace = true
-procfs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 walkdir = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = { workspace = true }

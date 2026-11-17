@@ -2,11 +2,10 @@ use crate::api;
 use anyhow::Result;
 use archimede_classify::BehaviorClassifier;
 use archimede_collect::spawn_all;
-use archimede_core::{
-    AgentCatalog, Config, Event, EventBus, EventKind, Store,
-};
+use archimede_core::{AgentCatalog, Config, Event, EventBus, EventKind, Store};
 use archimede_features::BucketAggregator;
 use archimede_forecast::ForecastEngine;
+use archimede_policy::PolicyEngine;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -20,6 +19,7 @@ pub async fn run(cfg: Arc<Config>) -> Result<()> {
 
     let catalog = Arc::new(AgentCatalog::from_config(&cfg.attribution.agents));
     let (bus, rx) = EventBus::unbounded();
+    let policy = Arc::new(PolicyEngine::new(cfg.clone()));
 
     let _collectors = spawn_all(cfg.clone(), catalog, bus.clone());
 
@@ -37,12 +37,25 @@ pub async fn run(cfg: Arc<Config>) -> Result<()> {
     let classifier_c = classifier.clone();
     let forecaster_c = forecaster.clone();
     let bus_c = bus.clone();
+    let policy_c = policy.clone();
     tokio::spawn(async move {
         while let Ok(event) = rx.recv_async().await {
             {
                 let s = store_c.lock().await;
                 if let Err(e) = s.insert_event(&event) {
                     tracing::warn!(error = %e, "store insert");
+                }
+            }
+
+            if let EventKind::Span(span) = &event.kind {
+                for hit in policy_c.evaluate_span(span) {
+                    {
+                        let s = store_c.lock().await;
+                        let _ = s.insert_event(&hit.alert);
+                        let _ = s.insert_event(&hit.decision_event);
+                    }
+                    let _ = bus_c.publish(hit.alert);
+                    let _ = bus_c.publish(hit.decision_event);
                 }
             }
 
@@ -59,6 +72,7 @@ pub async fn run(cfg: Arc<Config>) -> Result<()> {
                     &forecaster_c,
                     &hist_c,
                     &bus_c,
+                    &policy_c,
                     bucket,
                 )
                 .await;
@@ -74,6 +88,7 @@ pub async fn run(cfg: Arc<Config>) -> Result<()> {
     let classifier_f = classifier.clone();
     let forecaster_f = forecaster.clone();
     let bus_f = bus.clone();
+    let policy_f = policy.clone();
     tokio::spawn(async move {
         let period = std::time::Duration::from_secs(cfg_f.daemon.bucket_secs.max(5));
         loop {
@@ -90,6 +105,7 @@ pub async fn run(cfg: Arc<Config>) -> Result<()> {
                     &forecaster_f,
                     &hist_f,
                     &bus_f,
+                    &policy_f,
                     bucket,
                 )
                 .await;
@@ -97,10 +113,15 @@ pub async fn run(cfg: Arc<Config>) -> Result<()> {
         }
     });
 
-    tracing::info!(bind = %cfg.daemon.bind, "starting API");
-    api::serve(cfg.clone(), store).await
+    tracing::info!(
+        bind = %cfg.daemon.bind,
+        enforcement = cfg.enforcement.enabled,
+        "starting API"
+    );
+    api::serve(cfg.clone(), store, bus).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_bucket(
     cfg: &Config,
     store: &Arc<Mutex<Store>>,
@@ -108,6 +129,7 @@ async fn process_bucket(
     forecaster: &ForecastEngine,
     history: &Arc<Mutex<HashMap<String, Vec<archimede_features::FeatureBucket>>>>,
     bus: &EventBus,
+    policy: &PolicyEngine,
     bucket: archimede_features::FeatureBucket,
 ) {
     let agent = bucket.agent.clone();
@@ -121,22 +143,15 @@ async fn process_bucket(
         }
     }
 
-    // Risk rules
-    for (flag, message, score) in bucket.evaluate_risks(cfg) {
-        let ev = Event::new(
-            "risk_engine",
-            EventKind::Alert {
-                flag,
-                agent: Some(agent.clone()),
-                message: message.clone(),
-                score,
-            },
-        );
+    // Policy + legacy risk rules (policy covers bucket risks + new flags)
+    for hit in policy.evaluate_bucket(&bucket) {
         {
             let s = store.lock().await;
-            let _ = s.insert_event(&ev);
+            let _ = s.insert_event(&hit.alert);
+            let _ = s.insert_event(&hit.decision_event);
         }
-        let _ = bus.publish(ev);
+        let _ = bus.publish(hit.alert);
+        let _ = bus.publish(hit.decision_event);
     }
 
     // Classification
@@ -195,7 +210,13 @@ async fn process_bucket(
     };
 
     if series.len() >= 8 {
-        let metrics = ["exec_count", "socket_count", "egress_proxy_score", "cpu_pct_max"];
+        let metrics = [
+            "exec_count",
+            "socket_count",
+            "egress_proxy_score",
+            "cpu_pct_max",
+            "span_count",
+        ];
         if let Ok(forecasts) = forecaster.forecast_buckets(&series, &metrics).await {
             for f in forecasts {
                 let ev = Event::new(

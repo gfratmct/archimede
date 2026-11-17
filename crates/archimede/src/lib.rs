@@ -8,3 +8,4 @@ pub use archimede_collect as collect;
 pub use archimede_core as core;
 pub use archimede_features as features;
 pub use archimede_forecast as forecast;
+pub use archimede_policy as policy;

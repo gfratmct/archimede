@@ -2,7 +2,7 @@
 //!
 //! When the `ebpf` feature is enabled and CAP_BPF is available, this module
 //! will attach exec/connect/openat probes via Aya. Until then it runs a
-//! userspace fallback that synthesizes exec-like events from /proc delta scans
+//! userspace fallback that synthesizes exec-like events from process delta scans
 //! so the rest of the pipeline stays testable without privileged access.
 
 use anyhow::{bail, Result};
@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use sysinfo::{ProcessesToUpdate, System};
 
 use crate::Collector;
 
@@ -33,39 +34,44 @@ impl EbpfCollector {
     }
 
     async fn run_userspace_fallback(&self) -> Result<()> {
-        tracing::info!("eBPF unavailable or disabled feature; using /proc exec-delta fallback");
+        tracing::info!("eBPF unavailable or disabled feature; using process exec-delta fallback");
+        let mut sys = System::new();
         let mut seen: HashSet<(i32, String)> = HashSet::new();
         let interval = Duration::from_millis(self.cfg.daemon.poll_interval_ms);
         loop {
-            if let Ok(procs) = procfs::process::all_processes() {
-                for process in procs.flatten() {
-                    let Ok(stat) = process.stat() else {
-                        continue;
-                    };
-                    let cmdline = process.cmdline().unwrap_or_default().join(" ");
-                    let key = (process.pid, cmdline.clone());
-                    if !seen.insert(key) {
-                        continue;
-                    }
-                    if seen.len() > 50_000 {
-                        seen.clear();
-                    }
-                    let matched = self.catalog.match_process(&stat.comm, &cmdline);
-                    let agent_name = matched.as_ref().map(|m| m.name.clone());
-                    // Attribute child shells under known agents via ppid later; for now emit matched only.
-                    if agent_name.is_none() {
-                        continue;
-                    }
-                    let _ = self.bus.publish(Event::new(
-                        "ebpf_fallback",
-                        EventKind::Exec {
-                            pid: process.pid,
-                            ppid: stat.ppid,
-                            comm: stat.comm.clone(),
-                            argv_summary: cmdline.chars().take(200).collect(),
-                        },
-                    ));
+            sys.refresh_processes(ProcessesToUpdate::All, true);
+            for (pid, proc_) in sys.processes() {
+                let pid_i = pid.as_u32() as i32;
+                let comm = proc_.name().to_string_lossy().to_string();
+                let cmdline = proc_
+                    .cmd()
+                    .iter()
+                    .map(|s| s.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let key = (pid_i, cmdline.clone());
+                if !seen.insert(key) {
+                    continue;
                 }
+                if seen.len() > 50_000 {
+                    seen.clear();
+                }
+                let matched = self.catalog.match_process(&comm, &cmdline);
+                let agent_name = matched.as_ref().map(|m| m.name.clone());
+                // Attribute child shells under known agents via ppid later; for now emit matched only.
+                if agent_name.is_none() {
+                    continue;
+                }
+                let ppid = proc_.parent().map(|p| p.as_u32() as i32).unwrap_or(0);
+                let _ = self.bus.publish(Event::new(
+                    "ebpf_fallback",
+                    EventKind::Exec {
+                        pid: pid_i,
+                        ppid,
+                        comm,
+                        argv_summary: cmdline.chars().take(200).collect(),
+                    },
+                ));
             }
             tokio::time::sleep(interval).await;
         }

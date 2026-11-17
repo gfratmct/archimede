@@ -1,0 +1,17 @@
+[package]
+name = "archimede-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Security policy engine and optional enforcement for Archimede"
+
+[dependencies]
+anyhow.workspace = true
+archimede-core.workspace = true
+archimede-features.workspace = true
+chrono.workspace = true
+libc = "0.2"
+regex = "1"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

@@ -6,8 +6,20 @@ daemon:
   bind: "127.0.0.1:7432"
   enable_ebpf: false
 
+# Observe + alert by default. Set enabled: true to allow kill/deny actions.
+enforcement:
+  enabled: false
+  actions: [terminate_process]
+  cool_down_secs: 60
+
+policy:
+  max_span_egress_hosts: 8
+  flag_on_secret_patterns: true
+  flag_on_resource_spike_pct: 300
+  deny_tools: []
+  allow_models: []
+
 attribution:
-  # Process name / cmdline substrings mapped to agent families
   agents:
     - name: cursor
       family: coding_agent
@@ -18,6 +30,24 @@ attribution:
     - name: copilot
       family: coding_agent
       match: ["copilot", "github-copilot"]
+    - name: windsurf
+      family: coding_agent
+      match: ["windsurf", "Cascade"]
+    - name: aider
+      family: coding_agent
+      match: ["aider"]
+    - name: continue
+      family: coding_agent
+      match: ["continue-server", "continue.dev"]
+    - name: zed-agent
+      family: coding_agent
+      match: ["zed-agent"]
+    - name: amp
+      family: coding_agent
+      match: ["amp-cli", "sourcegraph-amp"]
+    - name: codex
+      family: coding_agent
+      match: ["codex", "openai-codex"]
     - name: openclaw
       family: harness
       match: ["openclaw"]
@@ -27,18 +57,67 @@ attribution:
     - name: pi
       family: harness
       match: ["pi-agent", "pi_agent"]
+    - name: langchain
+      family: harness
+      match: ["langchain", "langgraph"]
+    - name: llama-index
+      family: harness
+      match: ["llama-index", "llamaindex"]
+    - name: crewai
+      family: harness
+      match: ["crewai"]
+    - name: autogen
+      family: harness
+      match: ["autogen", "ag2"]
+    - name: semantic-kernel
+      family: harness
+      match: ["semantic-kernel", "semantickernel"]
+    - name: dspy
+      family: harness
+      match: ["dspy"]
+    - name: haystack
+      family: harness
+      match: ["haystack"]
     - name: ollama
       family: local_llm
       match: ["ollama"]
     - name: llama-server
       family: local_llm
       match: ["llama-server", "llama.cpp"]
+    - name: vllm
+      family: local_llm
+      match: ["vllm"]
+    - name: lmstudio
+      family: local_llm
+      match: ["lmstudio", "LM Studio"]
+    - name: kobold
+      family: local_llm
+      match: ["koboldcpp", "kobold"]
+    - name: text-generation-webui
+      family: local_llm
+      match: ["text-generation-webui", "oobabooga"]
+    - name: mlx
+      family: local_llm
+      match: ["mlx_lm", "mlx-lm"]
+    - name: openai-node
+      family: cloud_bridge
+      match: ["openai"]
+    - name: anthropic
+      family: cloud_bridge
+      match: ["anthropic"]
+    - name: gemini
+      family: cloud_bridge
+      match: ["gemini", "google-generativeai"]
 
 session_logs:
   paths:
     - "~/.cursor"
     - "~/.claude"
     - "~/.config/github-copilot"
+    - "~/.codex"
+    - "~/.aider"
+    - "~/.continue"
+    - "~/.codeium"
 
 classify:
   endpoint: "http://127.0.0.1:8017/v1/systemone"
@@ -59,9 +138,7 @@ forecast:
   model_size: "5M" # 5M | 28M
   context_len: 256
   horizon: 16
-  # Optional ONNX export path for Rust ort inference
   onnx_path: null
-  # Optional Timestral Python sidecar
   sidecar_url: null
 
 alerts:

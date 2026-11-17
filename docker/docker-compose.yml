@@ -1,0 +1,32 @@
+# Portable Archimede daemon (API + harness span ingest).
+# Works on Docker Desktop (macOS/Windows) and Linux.
+#
+# Usage (from repo root or this directory):
+#   docker compose -f docker/docker-compose.yml up --build -d
+#   curl -s http://127.0.0.1:7432/health
+#
+# For host process/socket visibility on Linux use:
+#   docker compose -f docker/docker-compose.host.yml up --build -d
+
+services:
+  archimede:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: archimede:local
+    container_name: archimede
+    restart: unless-stopped
+    ports:
+      - "${ARCHIMEDE_PORT:-7432}:7432"
+    volumes:
+      - archimede-data:/data
+      - ./archimede.yaml:/etc/archimede/archimede.yaml:ro
+    healthcheck:
+      test: ["CMD", "archimede", "--config", "/etc/archimede/archimede.yaml", "stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  archimede-data:

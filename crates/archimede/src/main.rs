@@ -41,6 +41,27 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Print recent harness/LLM traces
+    Traces {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Print security flags
+    Flags {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        trace_id: Option<String>,
+    },
+    /// Show enforcement config and recent actions
+    EnforceStatus {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Export feature buckets as JSONL for ML pipelines
     Export {
         #[arg(long)]
@@ -87,6 +108,34 @@ async fn main() -> Result<()> {
             let store = open_store(&cfg)?;
             let alerts = store.recent_alerts(limit)?;
             println!("{}", serde_json::to_string_pretty(&alerts)?);
+            Ok(())
+        }
+        Commands::Traces { limit, agent } => {
+            let store = open_store(&cfg)?;
+            let traces = store.recent_traces(limit, agent.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&traces)?);
+            Ok(())
+        }
+        Commands::Flags {
+            limit,
+            agent,
+            trace_id,
+        } => {
+            let store = open_store(&cfg)?;
+            let flags = store.recent_flags(limit, agent.as_deref(), trace_id.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&flags)?);
+            Ok(())
+        }
+        Commands::EnforceStatus { limit } => {
+            let store = open_store(&cfg)?;
+            let recent = store.recent_enforcement(limit)?;
+            let out = serde_json::json!({
+                "enforcement_enabled": cfg.enforcement.enabled,
+                "actions_allowlist": cfg.enforcement.actions,
+                "cool_down_secs": cfg.enforcement.cool_down_secs,
+                "recent": recent,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
             Ok(())
         }
         Commands::Export { out, limit } => {

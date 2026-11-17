@@ -8,8 +8,12 @@ pub mod store;
 
 pub use attribution::{AgentCatalog, AgentMatch};
 pub use bus::EventBus;
-pub use config::Config;
+pub use config::{Config, EnforcementConfig, PolicyConfig};
 pub use event::{
-    BehaviorLabel, Event, EventKind, FileOp, NetworkMeta, ProcessSnapshot, RiskFlag, SessionHint,
+    BehaviorLabel, EnforcementAction, Event, EventKind, FileOp, NetworkMeta, PolicyDecision,
+    ProcessSnapshot, ResourceDelta, RiskFlag, SessionHint, SpanKind, SpanRecord, TokenUsage,
+    TraceRecord,
 };
-pub use store::Store;
+pub use store::{
+    AlertRow, EnforcementRow, FlagRow, MetricPoint, StatsSummary, Store, TraceTree,
+};
