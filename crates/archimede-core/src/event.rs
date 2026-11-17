@@ -75,6 +75,7 @@ pub enum RiskFlag {
     SuspiciousDns,
     ElevatedRiskScore,
     PromptInjectionHint,
+    RemoteControlHint,
     SecretExfilHint,
     UnauthorizedTool,
     ShadowBinary,
@@ -93,6 +94,7 @@ impl RiskFlag {
             Self::SuspiciousDns => "suspicious_dns",
             Self::ElevatedRiskScore => "elevated_risk_score",
             Self::PromptInjectionHint => "prompt_injection_hint",
+            Self::RemoteControlHint => "remote_control_hint",
             Self::SecretExfilHint => "secret_exfil_hint",
             Self::UnauthorizedTool => "unauthorized_tool",
             Self::ShadowBinary => "shadow_binary",
@@ -207,6 +209,51 @@ impl EnforcementAction {
     }
 }
 
+/// Process / command / network / text context attached to alerts and flags.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct RiskEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ppid: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    /// Executable path or cmdline when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Recent argv / shell commands (newest last, capped).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior_confidence: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_score: Option<f32>,
+    /// Session / span text excerpts that triggered or contextualize the hit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_snippets: Vec<String>,
+    /// Concrete network requests (`host:port` / SNI / DNS).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_requests: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remotes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binaries: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_summary: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyDecision {
     pub flag: RiskFlag,
@@ -218,6 +265,8 @@ pub struct PolicyDecision {
     pub span_id: Option<String>,
     pub score: f32,
     pub enforced: bool,
+    #[serde(default)]
+    pub evidence: RiskEvidence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +300,12 @@ pub enum EventKind {
         label: BehaviorLabel,
         confidence: f32,
         source: String,
+        /// Normalized risk in `[0, 1]` from the decision model (or rules fallback).
+        #[serde(default)]
+        risk_score: Option<f32>,
+        /// Per-label probabilities when available from System-One.
+        #[serde(default)]
+        probabilities: std::collections::HashMap<String, f32>,
     },
     Forecast {
         metric: String,
@@ -264,6 +319,8 @@ pub enum EventKind {
         agent: Option<String>,
         message: String,
         score: f32,
+        #[serde(default)]
+        evidence: RiskEvidence,
     },
 }
 
@@ -284,8 +341,22 @@ pub struct ProcessSnapshot {
 pub struct FileOp {
     pub pid: i32,
     pub path: String,
-    pub op: String, // open|write|unlink|rename
+    /// Normalized op: `create` | `edit` | `delete` (aliases like write/unlink accepted).
+    pub op: String,
     pub agent: Option<String>,
+}
+
+impl FileOp {
+    /// Map raw collector / tool labels onto create|edit|delete.
+    pub fn normalize_op(op: &str) -> &'static str {
+        match op.to_ascii_lowercase().as_str() {
+            "create" | "created" | "new" | "add" | "touch" => "create",
+            "delete" | "deleted" | "unlink" | "remove" | "rm" | "trash" => "delete",
+            "edit" | "edited" | "write" | "wrote" | "modify" | "modified" | "open"
+            | "rename" | "update" | "patch" | "strreplace" => "edit",
+            _ => "edit",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +388,10 @@ pub struct Event {
 
 impl Event {
     pub fn new(source: impl Into<String>, kind: EventKind) -> Self {
+        Self::with_id(Uuid::new_v4(), source, kind)
+    }
+
+    pub fn with_id(id: Uuid, source: impl Into<String>, kind: EventKind) -> Self {
         let agent = match &kind {
             EventKind::ProcessSnapshot(p) => p.agent.clone(),
             EventKind::File(f) => f.agent.clone(),
@@ -333,7 +408,7 @@ impl Event {
             | EventKind::Forecast { .. } => None,
         };
         Self {
-            id: Uuid::new_v4(),
+            id,
             ts: Utc::now(),
             source: source.into(),
             agent,

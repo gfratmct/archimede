@@ -15,6 +15,66 @@ pub struct Config {
     pub enforcement: EnforcementConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
+    /// Watch agent working directories for create / edit / delete file activity.
+    #[serde(default)]
+    pub file_watch: FileWatchConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileWatchConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How deep to walk each watched root.
+    #[serde(default = "default_file_watch_depth")]
+    pub max_depth: usize,
+    /// Cap emitted File events per scan to avoid log storms.
+    #[serde(default = "default_file_watch_max_events")]
+    pub max_events_per_scan: usize,
+    /// Extra roots beyond live agent CWDs.
+    #[serde(default)]
+    pub roots: Vec<String>,
+    /// Directory basenames skipped while walking.
+    #[serde(default = "default_file_watch_ignore")]
+    pub ignore_dirs: Vec<String>,
+}
+
+impl Default for FileWatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_depth: default_file_watch_depth(),
+            max_events_per_scan: default_file_watch_max_events(),
+            roots: Vec::new(),
+            ignore_dirs: default_file_watch_ignore(),
+        }
+    }
+}
+
+fn default_file_watch_depth() -> usize {
+    4
+}
+
+fn default_file_watch_max_events() -> usize {
+    80
+}
+
+fn default_file_watch_ignore() -> Vec<String> {
+    vec![
+        ".git".into(),
+        "node_modules".into(),
+        "target".into(),
+        "dist".into(),
+        "build".into(),
+        ".venv".into(),
+        "venv".into(),
+        "__pycache__".into(),
+        ".tox".into(),
+        ".mypy_cache".into(),
+        ".pytest_cache".into(),
+        ".next".into(),
+        ".cache".into(),
+        "Library".into(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +84,15 @@ pub struct DaemonConfig {
     pub data_dir: String,
     pub bind: String,
     pub enable_ebpf: bool,
+    /// Directory with the SolidJS dashboard build (`index.html` + assets).
+    /// When set (and present), the API serves it at `/`.
+    #[serde(default)]
+    pub dashboard_dir: Option<String>,
+    /// Optional shared secret for mutating API routes (`POST /v1/clear`, and
+    /// ingest when enforcement is enabled). Send as `X-Archimede-Token` or
+    /// `Authorization: Bearer …`.
+    #[serde(default)]
+    pub api_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,12 +158,28 @@ impl Default for EnforcementConfig {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
     pub max_span_egress_hosts: u64,
     pub flag_on_secret_patterns: bool,
+    #[serde(default = "default_true")]
+    pub flag_on_prompt_injection: bool,
+    #[serde(default = "default_true")]
+    pub flag_on_remote_control: bool,
+    /// Flag high-risk harness tools (shell/exec/curl/…) for human review even
+    /// when they are not listed in `deny_tools`.
+    #[serde(default = "default_true")]
+    pub flag_dangerous_tools: bool,
     pub flag_on_resource_spike_pct: u64,
+    /// Tools that are denied (UnauthorizedTool; may terminate when enforcement on).
     pub deny_tools: Vec<String>,
+    /// Extra tool names treated as dangerous for reporting (merged with builtins).
+    #[serde(default)]
+    pub warn_tools: Vec<String>,
     pub allow_models: Vec<String>,
 }
 
@@ -103,8 +188,12 @@ impl Default for PolicyConfig {
         Self {
             max_span_egress_hosts: 8,
             flag_on_secret_patterns: true,
+            flag_on_prompt_injection: true,
+            flag_on_remote_control: true,
+            flag_dangerous_tools: true,
             flag_on_resource_spike_pct: 300,
             deny_tools: Vec::new(),
+            warn_tools: Vec::new(),
             allow_models: Vec::new(),
         }
     }
@@ -121,7 +210,12 @@ fn default_agents() -> Vec<AgentRule> {
         AgentRule {
             name: "claude-code".into(),
             family: "coding_agent".into(),
-            match_patterns: vec!["claude".into(), "claude-code".into()],
+            // Avoid bare "claude" — too broad; prefer explicit binary/cli names.
+            match_patterns: vec![
+                "claude-code".into(),
+                "claude code".into(),
+                "@anthropic-ai/claude".into(),
+            ],
         },
         AgentRule {
             name: "copilot".into(),
@@ -273,6 +367,8 @@ impl Default for Config {
                 data_dir: "~/.local/share/archimede".into(),
                 bind: "127.0.0.1:7432".into(),
                 enable_ebpf: false,
+                dashboard_dir: Some("dashboard/dist".into()),
+                api_token: None,
             },
             attribution: AttributionConfig {
                 agents: default_agents(),
@@ -291,7 +387,7 @@ impl Default for Config {
             classify: ClassifyConfig {
                 endpoint: "http://127.0.0.1:8017/v1/systemone".into(),
                 model: "jev-latest".into(),
-                timeout_ms: 500,
+                timeout_ms: 5000,
                 fallback_rules: true,
                 labels: crate::event::BehaviorLabel::all()
                     .iter()
@@ -313,6 +409,7 @@ impl Default for Config {
             },
             enforcement: EnforcementConfig::default(),
             policy: PolicyConfig::default(),
+            file_watch: FileWatchConfig::default(),
         }
     }
 }
@@ -349,6 +446,14 @@ impl Config {
 
     pub fn expand_data_dir(&self) -> PathBuf {
         expand_tilde(&self.daemon.data_dir)
+    }
+
+    pub fn expand_dashboard_dir(&self) -> Option<PathBuf> {
+        self.daemon
+            .dashboard_dir
+            .as_ref()
+            .map(|p| expand_tilde(p))
+            .filter(|p| p.join("index.html").is_file())
     }
 }
 

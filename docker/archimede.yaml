@@ -5,6 +5,25 @@ daemon:
   data_dir: "/data"
   bind: "0.0.0.0:7432"
   enable_ebpf: false
+  dashboard_dir: null
+  # REQUIRED for non-loopback bind (clear + protected ingest).
+  api_token: "change-me-in-production"
+
+file_watch:
+  enabled: true
+  max_depth: 4
+  max_events_per_scan: 80
+  roots: []
+  ignore_dirs:
+    - .git
+    - node_modules
+    - target
+    - dist
+    - build
+    - .venv
+    - __pycache__
+    - .next
+    - .cache
 
 enforcement:
   enabled: false
@@ -14,8 +33,12 @@ enforcement:
 policy:
   max_span_egress_hosts: 8
   flag_on_secret_patterns: true
+  flag_on_prompt_injection: true
+  flag_on_remote_control: true
+  flag_dangerous_tools: true
   flag_on_resource_spike_pct: 300
   deny_tools: []
+  warn_tools: []
   allow_models: []
 
 attribution:
@@ -115,7 +138,7 @@ session_logs:
 classify:
   endpoint: "http://127.0.0.1:8017/v1/systemone"
   model: "jev-latest"
-  timeout_ms: 500
+  timeout_ms: 5000
   fallback_rules: true
   labels:
     - idle

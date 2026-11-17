@@ -61,11 +61,22 @@ pub fn rule_classify(bucket: &FeatureBucket) -> Classification {
     let mut probabilities = HashMap::new();
     probabilities.insert(label.as_str().to_string(), confidence);
 
+    let risk_score = if matches!(label, BehaviorLabel::RiskyEgress) {
+        confidence
+    } else if bucket.egress_proxy_score > 20.0 || bucket.files_deleted > 5 {
+        0.6
+    } else if bucket.new_remotes > 0 || bucket.resource_spikes > 0 {
+        0.4
+    } else {
+        0.1
+    };
+
     Classification {
         label,
         confidence,
         source: "rules".into(),
         probabilities,
+        risk_score,
     }
 }
 

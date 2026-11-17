@@ -1,7 +1,7 @@
 use crate::api;
 use anyhow::Result;
 use archimede_classify::BehaviorClassifier;
-use archimede_collect::spawn_all;
+use archimede_collect::{file_ops_from_span, spawn_all};
 use archimede_core::{AgentCatalog, Config, Event, EventBus, EventKind, Store};
 use archimede_features::BucketAggregator;
 use archimede_forecast::ForecastEngine;
@@ -47,14 +47,47 @@ pub async fn run(cfg: Arc<Config>) -> Result<()> {
                 }
             }
 
+            // Derive create/edit/delete file logs from harness tool spans.
             if let EventKind::Span(span) = &event.kind {
-                for hit in policy_c.evaluate_span(span) {
+                for op in file_ops_from_span(span) {
+                    let file_ev = Event::new("span_files", EventKind::File(op));
                     {
                         let s = store_c.lock().await;
-                        let _ = s.insert_event(&hit.alert);
-                        let _ = s.insert_event(&hit.decision_event);
+                        let _ = s.insert_event(&file_ev);
                     }
+                    {
+                        let mut agg = agg_c.lock().await;
+                        let _ = agg.ingest(&file_ev);
+                    }
+                }
+            }
+
+            let policy_hits = match &event.kind {
+                EventKind::Span(span) => policy_c.evaluate_span(span),
+                EventKind::Session(session) => policy_c.evaluate_session(session),
+                EventKind::Exec {
+                    argv_summary,
+                    comm,
+                    pid,
+                    ..
+                } => {
+                    // Fast path for reverse-shell style argv before bucket flush.
+                    let blob = format!("{comm} {argv_summary}");
+                    policy_c.evaluate_exec_argv(&blob, event.agent.clone(), Some(*pid))
+                }
+                _ => Vec::new(),
+            };
+            for hit in policy_hits {
+                let (new_alert, new_decision) = {
+                    let s = store_c.lock().await;
+                    let a = s.insert_event(&hit.alert).unwrap_or(false);
+                    let d = s.insert_event(&hit.decision_event).unwrap_or(false);
+                    (a, d)
+                };
+                if new_alert {
                     let _ = bus_c.publish(hit.alert);
+                }
+                if new_decision {
                     let _ = bus_c.publish(hit.decision_event);
                 }
             }
@@ -118,7 +151,7 @@ pub async fn run(cfg: Arc<Config>) -> Result<()> {
         enforcement = cfg.enforcement.enabled,
         "starting API"
     );
-    api::serve(cfg.clone(), store, bus).await
+    api::serve(cfg.clone(), store, bus, policy).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -145,16 +178,21 @@ async fn process_bucket(
 
     // Policy + legacy risk rules (policy covers bucket risks + new flags)
     for hit in policy.evaluate_bucket(&bucket) {
-        {
+        let (new_alert, new_decision) = {
             let s = store.lock().await;
-            let _ = s.insert_event(&hit.alert);
-            let _ = s.insert_event(&hit.decision_event);
+            let a = s.insert_event(&hit.alert).unwrap_or(false);
+            let d = s.insert_event(&hit.decision_event).unwrap_or(false);
+            (a, d)
+        };
+        if new_alert {
+            let _ = bus.publish(hit.alert);
         }
-        let _ = bus.publish(hit.alert);
-        let _ = bus.publish(hit.decision_event);
+        if new_decision {
+            let _ = bus.publish(hit.decision_event);
+        }
     }
 
-    // Classification
+    // Classification (still recorded for inactive agents; alerts only when active + concrete)
     match classifier.classify_bucket(&bucket).await {
         Ok(c) => {
             let ev = Event::new(
@@ -164,6 +202,8 @@ async fn process_bucket(
                     label: c.label,
                     confidence: c.confidence,
                     source: c.source.clone(),
+                    risk_score: Some(c.risk_score),
+                    probabilities: c.probabilities.clone(),
                 },
             );
             {
@@ -172,26 +212,35 @@ async fn process_bucket(
             }
             let _ = bus.publish(ev);
 
-            if c.confidence >= cfg.alerts.risk_score_threshold
-                && matches!(c.label, archimede_core::BehaviorLabel::RiskyEgress)
-            {
-                let ev = Event::new(
-                    "classify",
-                    EventKind::Alert {
-                        flag: archimede_core::RiskFlag::ElevatedRiskScore,
-                        agent: Some(agent.clone()),
-                        message: format!(
-                            "{} classified as risky_egress ({:.2})",
-                            agent, c.confidence
-                        ),
-                        score: c.confidence,
-                    },
-                );
-                {
+            let top = {
+                let mut pairs: Vec<_> = c.probabilities.iter().collect();
+                pairs.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+                pairs
+                    .into_iter()
+                    .take(3)
+                    .map(|(k, v)| format!("{k}={:.0}%", v * 100.0))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            if let Some(hit) = policy.evaluate_classification_risk(
+                &bucket,
+                c.label.as_str(),
+                c.confidence,
+                c.risk_score,
+                &top,
+            ) {
+                let (new_alert, new_decision) = {
                     let s = store.lock().await;
-                    let _ = s.insert_event(&ev);
+                    let a = s.insert_event(&hit.alert).unwrap_or(false);
+                    let d = s.insert_event(&hit.decision_event).unwrap_or(false);
+                    (a, d)
+                };
+                if new_alert {
+                    let _ = bus.publish(hit.alert);
                 }
-                let _ = bus.publish(ev);
+                if new_decision {
+                    let _ = bus.publish(hit.decision_event);
+                }
             }
         }
         Err(e) => tracing::debug!(error = %e, "classification skipped"),

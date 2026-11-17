@@ -1,11 +1,13 @@
-//! Collectors for process, network metadata, optional eBPF, and session logs.
+//! Collectors for process, network metadata, optional eBPF, session logs, and files.
 
 pub mod ebpf;
+pub mod files;
 pub mod proc_poller;
 pub mod session;
 pub mod sockets;
 
 pub use ebpf::EbpfCollector;
+pub use files::{file_ops_from_span, FileWatcher};
 pub use proc_poller::ProcPoller;
 pub use session::SessionWatcher;
 pub use sockets::SocketPoller;
@@ -50,6 +52,15 @@ pub fn spawn_all(
             tracing::error!(error = %e, "session watcher stopped");
         }
     }));
+
+    if cfg.file_watch.enabled {
+        let files = FileWatcher::new(cfg.clone(), catalog.clone(), bus.clone());
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = files.run().await {
+                tracing::warn!(error = %e, "file watcher stopped");
+            }
+        }));
+    }
 
     if cfg.daemon.enable_ebpf {
         let ebpf = EbpfCollector::new(cfg.clone(), catalog, bus);

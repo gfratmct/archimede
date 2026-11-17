@@ -17,6 +17,21 @@ DEFAULT_LABELS = [
     "risky_egress",
 ]
 
+# Descriptions the decision model reads; keys are returned as the choice ids.
+LABEL_CRITERIA = {
+    "idle": "no meaningful agent activity",
+    "planning": "reasoning or planning next steps",
+    "coding": "editing or generating source code",
+    "testing": "running tests or verifying behavior",
+    "shell_tools": "shell commands and local tooling",
+    "browsing": "web, docs, or remote content access",
+    "llm_wait": "waiting on model or API responses",
+    "risky_egress": "suspicious outbound traffic or destructive activity",
+}
+
+# Ordered risk rubric (lowest → highest). Score answers are expected level indices.
+RISK_LEVELS = ["benign", "low", "elevated", "high", "harmful"]
+
 
 class SystemOneClient:
     def __init__(
@@ -40,15 +55,17 @@ class SystemOneClient:
         self, state: str, labels: list[str] | None = None
     ) -> tuple[str, float, dict[str, float]]:
         labels = labels or DEFAULT_LABELS
+        criteria = {k: LABEL_CRITERIA.get(k, k.replace("_", " ")) for k in labels}
         questions = {
             "behavior": {
                 "type": "choice",
                 "instructions": "Classify the primary agent behavior for this monitoring bucket.",
-                "choices": labels,
+                "criteria": criteria,
             },
             "risk": {
                 "type": "score",
-                "instructions": "Score security risk from 0 (benign) to 1 (harmful).",
+                "instructions": "Score security risk from benign collaboration to likely harmful.",
+                "criteria": RISK_LEVELS,
             },
         }
         data = self.decide(state, questions)

@@ -26,20 +26,24 @@ impl SessionWatcher {
         }
     }
 
-    fn infer_agent(path: &Path) -> String {
+    fn infer_agent(path: &Path) -> Option<String> {
         let s = path.to_string_lossy().to_ascii_lowercase();
-        if s.contains("cursor") {
-            "cursor".into()
-        } else if s.contains("claude") {
-            "claude-code".into()
+        if s.contains("/.cursor/") || s.contains("/.cursor\\") || s.ends_with("/.cursor") {
+            Some("cursor".into())
+        } else if s.contains("/.claude/") || s.contains("/.claude\\") || s.ends_with("/.claude") {
+            Some("claude-code".into())
         } else if s.contains("copilot") {
-            "copilot".into()
+            Some("copilot".into())
         } else if s.contains("openclaw") {
-            "openclaw".into()
+            Some("openclaw".into())
         } else if s.contains("hermes") {
-            "hermes".into()
+            Some("hermes".into())
+        } else if s.contains("codex") {
+            Some("codex".into())
         } else {
-            "unknown".into()
+            // Skip unattributed session files — they used to become agent "unknown"
+            // and produce empty risky_egress false positives.
+            None
         }
     }
 
@@ -149,6 +153,14 @@ impl Collector for SessionWatcher {
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
+                    // Ignore stale session files (not touched in the last 15 minutes).
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if now_secs.saturating_sub(modified) > 15 * 60 {
+                        continue;
+                    }
                     let key = format!("{}@{}", path.display(), modified);
                     {
                         let mut seen = self.seen.lock().await;
@@ -161,7 +173,9 @@ impl Collector for SessionWatcher {
                             seen.clear();
                         }
                     }
-                    let agent = Self::infer_agent(path);
+                    let Some(agent) = Self::infer_agent(path) else {
+                        continue;
+                    };
                     match self.scan_file(path, &agent) {
                         Ok(events) => {
                             for ev in events {

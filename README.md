@@ -30,6 +30,8 @@ enforcement:
 policy:
   max_span_egress_hosts: 8
   flag_on_secret_patterns: true
+  flag_on_prompt_injection: true
+  flag_on_remote_control: true
   flag_on_resource_spike_pct: 300
   deny_tools: []      # e.g. ["bash", "curl"]
   allow_models: []    # empty = allow all
@@ -116,6 +118,22 @@ curl -s localhost:7432/v1/flags | jq
 ```
 
 Data directory defaults to `~/.local/share/archimede/archimede.sqlite`.
+
+## Dashboard (SolidJS)
+
+Live monitor for stats, alerts, flags, logs, traces, enforcement, and config — with toast + optional desktop notifications.
+
+```bash
+cd dashboard && npm install && npm run build
+# daemon.dashboard_dir: "dashboard/dist" in configs/archimede.yaml
+./target/release/archimede --config configs/archimede.yaml daemon
+# → http://127.0.0.1:7432/
+
+# Or hot-reload UI while the daemon runs:
+cd dashboard && npm run dev   # http://127.0.0.1:5173 (proxies API)
+```
+
+See [`dashboard/README.md`](dashboard/README.md).
 
 ## System-One (open Jev)
 

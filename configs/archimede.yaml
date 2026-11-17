@@ -5,8 +5,31 @@ daemon:
   data_dir: "~/.local/share/archimede"
   bind: "127.0.0.1:7432"
   enable_ebpf: false
+  # Built SolidJS UI (`cd dashboard && npm run build`)
+  dashboard_dir: "dashboard/dist"
+  # Optional: required for POST /v1/clear and for ingest when enforcement is on.
+  # api_token: "change-me"
+
+# Watch agent CWDs for create / edit / delete file logs (also inferred from tool spans).
+file_watch:
+  enabled: true
+  max_depth: 4
+  max_events_per_scan: 80
+  roots: []
+  ignore_dirs:
+    - .git
+    - node_modules
+    - target
+    - dist
+    - build
+    - .venv
+    - venv
+    - __pycache__
+    - .next
+    - .cache
 
 # Observe + alert by default. Set enabled: true to allow kill/deny actions.
+# When enabled, set daemon.api_token so span ingest cannot be abused.
 enforcement:
   enabled: false
   actions: [terminate_process]
@@ -15,8 +38,14 @@ enforcement:
 policy:
   max_span_egress_hosts: 8
   flag_on_secret_patterns: true
+  flag_on_prompt_injection: true
+  flag_on_remote_control: true
+  flag_dangerous_tools: true
   flag_on_resource_spike_pct: 300
+  # Hard deny (may terminate when enforcement.enabled):
   deny_tools: []
+  # Extra names merged with builtins (bash/shell/curl/exec/…):
+  warn_tools: []
   allow_models: []
 
 attribution:
@@ -26,7 +55,7 @@ attribution:
       match: ["cursor", "Cursor"]
     - name: claude-code
       family: coding_agent
-      match: ["claude", "claude-code"]
+      match: ["claude-code", "claude code", "@anthropic-ai/claude"]
     - name: copilot
       family: coding_agent
       match: ["copilot", "github-copilot"]
@@ -120,9 +149,9 @@ session_logs:
     - "~/.codeium"
 
 classify:
-  endpoint: "http://127.0.0.1:8017/v1/systemone"
-  model: "jev-latest"
-  timeout_ms: 500
+  endpoint: "http://127.0.0.1:9931/v1/systemone"
+  model: "ggml-org/Julia-1-GGUF:BF16"
+  timeout_ms: 5000
   fallback_rules: true
   labels:
     - idle

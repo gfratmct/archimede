@@ -2,7 +2,9 @@ use anyhow::Result;
 use archimede_core::{
     Config, Event, EventBus, EventKind, SpanRecord, Store, TraceRecord,
 };
+use archimede_policy::PolicyEngine;
 use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
@@ -11,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -19,19 +22,22 @@ struct AppState {
     store: Arc<Mutex<Store>>,
     cfg: Arc<Config>,
     bus: EventBus,
+    policy: Arc<PolicyEngine>,
 }
 
 pub async fn serve(
     cfg: Arc<Config>,
     store: Arc<Mutex<Store>>,
     bus: EventBus,
+    policy: Arc<PolicyEngine>,
 ) -> Result<()> {
     let state = AppState {
         store,
         cfg: cfg.clone(),
         bus,
+        policy,
     };
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/v1/stats", get(stats))
         .route("/v1/logs", get(logs))
@@ -43,14 +49,81 @@ pub async fn serve(
         .route("/v1/spans", post(ingest_spans))
         .route("/v1/flags", get(list_flags))
         .route("/v1/enforcement", get(list_enforcement))
+        .route("/v1/clear", post(clear_alerts_and_flags))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
+    if let Some(dir) = cfg.expand_dashboard_dir() {
+        let index = dir.join("index.html");
+        tracing::info!(path = %dir.display(), "serving dashboard");
+        let spa = ServeDir::new(dir).not_found_service(ServeFile::new(index));
+        app = app.fallback_service(spa);
+    } else {
+        tracing::info!("dashboard_dir unset or missing index.html; API-only mode");
+    }
+
     let addr: SocketAddr = cfg.daemon.bind.parse()?;
+    if !is_loopback_bind(&cfg.daemon.bind) && cfg.daemon.api_token.as_ref().map(|t| t.is_empty()).unwrap_or(true) {
+        tracing::warn!(
+            bind = %cfg.daemon.bind,
+            "daemon binds non-loopback without api_token; mutating routes are unprotected"
+        );
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "API listening");
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn is_loopback_bind(bind: &str) -> bool {
+    bind.starts_with("127.") || bind.starts_with("[::1]") || bind.starts_with("localhost")
+}
+
+fn extract_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get("x-archimede-token").and_then(|v| v.to_str().ok()) {
+        return Some(v.to_string());
+    }
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer ").map(|s| s.to_string()))
+}
+
+fn require_api_token(cfg: &Config, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(expected) = cfg.daemon.api_token.as_ref().filter(|t| !t.is_empty()) else {
+        // No token configured: allow only on loopback binds.
+        if is_loopback_bind(&cfg.daemon.bind) {
+            return Ok(());
+        }
+        return Err(ApiError::forbidden(
+            "api_token required when daemon.bind is not loopback",
+        ));
+    };
+    match extract_token(headers) {
+        Some(got) if got == *expected => Ok(()),
+        _ => Err(ApiError::unauthorized(
+            "missing or invalid X-Archimede-Token / Bearer token",
+        )),
+    }
+}
+
+/// Mutating ingest is token-gated when enforcement is enabled (prevents
+/// unauthenticated span injection that could drive policy actions).
+fn require_ingest_auth(cfg: &Config, headers: &HeaderMap) -> Result<(), ApiError> {
+    if cfg.enforcement.enabled {
+        return require_api_token(cfg, headers);
+    }
+    // Still require token if configured.
+    if cfg
+        .daemon
+        .api_token
+        .as_ref()
+        .map(|t| !t.is_empty())
+        .unwrap_or(false)
+    {
+        return require_api_token(cfg, headers);
+    }
     Ok(())
 }
 
@@ -116,7 +189,17 @@ async fn metrics(
 }
 
 async fn config_view(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::to_value(state.cfg.as_ref()).unwrap_or_default())
+    // Never expose api_token in the config view.
+    let mut v = serde_json::to_value(state.cfg.as_ref()).unwrap_or_default();
+    if let Some(obj) = v.get_mut("daemon").and_then(|d| d.as_object_mut()) {
+        if obj.contains_key("api_token") {
+            obj.insert(
+                "api_token".into(),
+                serde_json::Value::String("[redacted]".into()),
+            );
+        }
+    }
+    Json(v)
 }
 
 #[derive(Deserialize)]
@@ -164,8 +247,10 @@ struct CreateTraceRequest {
 
 async fn create_trace(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CreateTraceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_ingest_auth(&state.cfg, &headers)?;
     let trace = TraceRecord {
         trace_id: body
             .trace_id
@@ -199,8 +284,10 @@ enum SpansBody {
 
 async fn ingest_spans(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<SpansBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_ingest_auth(&state.cfg, &headers)?;
     let spans = match body {
         SpansBody::One(s) => vec![s],
         SpansBody::Many { spans } => spans,
@@ -208,6 +295,7 @@ async fn ingest_spans(
     let mut accepted = 0usize;
     for span in spans {
         // Daemon consumer persists + runs policy; API only publishes.
+        // Policy never uses client-supplied attrs.pid for process termination.
         let ev = Event::new("harness_sdk", EventKind::Span(span));
         let _ = state.bus.publish(ev);
         accepted += 1;
@@ -248,15 +336,47 @@ async fn list_enforcement(
     })))
 }
 
+async fn clear_alerts_and_flags(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Always require token when configured; otherwise loopback-only.
+    require_api_token(&state.cfg, &headers)?;
+    let (alerts, flags) = {
+        let store = state.store.lock().await;
+        store.clear_alerts_and_flags().map_err(ApiError::from)?
+    };
+    state.policy.forget_seen();
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "cleared_alerts": alerts,
+        "cleared_flags": flags,
+    })))
+}
+
 struct ApiError {
-    status: axum::http::StatusCode,
+    status: StatusCode,
     message: String,
 }
 
 impl ApiError {
     fn not_found(msg: impl Into<String>) -> Self {
         Self {
-            status: axum::http::StatusCode::NOT_FOUND,
+            status: StatusCode::NOT_FOUND,
+            message: msg.into(),
+        }
+    }
+
+    fn unauthorized(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: msg.into(),
+        }
+    }
+
+    fn forbidden(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
             message: msg.into(),
         }
     }
@@ -265,7 +385,7 @@ impl ApiError {
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
         Self {
-            status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            status: StatusCode::INTERNAL_SERVER_ERROR,
             message: e.to_string(),
         }
     }

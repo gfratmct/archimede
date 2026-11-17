@@ -1,5 +1,6 @@
 use crate::event::{
-    BehaviorLabel, Event, EventKind, PolicyDecision, RiskFlag, SpanRecord, TraceRecord,
+    BehaviorLabel, Event, EventKind, PolicyDecision, RiskEvidence, RiskFlag, SpanRecord,
+    TraceRecord,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -36,6 +37,8 @@ pub struct AlertRow {
     pub flag: String,
     pub message: String,
     pub score: f32,
+    #[serde(default)]
+    pub evidence: RiskEvidence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +58,8 @@ pub struct FlagRow {
     pub message: String,
     pub score: f32,
     pub trace_id: Option<String>,
+    #[serde(default)]
+    pub evidence: RiskEvidence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +101,7 @@ impl Store {
         )?;
         let store = Self { conn };
         store.migrate()?;
+        store.migrate_columns()?;
         Ok(store)
     }
 
@@ -104,7 +110,19 @@ impl Store {
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         let store = Self { conn };
         store.migrate()?;
+        store.migrate_columns()?;
         Ok(store)
+    }
+
+    fn migrate_columns(&self) -> Result<()> {
+        // Additive columns for existing DBs; ignore "duplicate column" errors.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE alerts ADD COLUMN evidence TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE flags ADD COLUMN evidence TEXT", []);
+        Ok(())
     }
 
     fn migrate(&self) -> Result<()> {
@@ -137,7 +155,8 @@ impl Store {
                 agent TEXT,
                 flag TEXT NOT NULL,
                 message TEXT NOT NULL,
-                score REAL NOT NULL
+                score REAL NOT NULL,
+                evidence TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);
 
@@ -200,7 +219,8 @@ impl Store {
                 flag TEXT NOT NULL,
                 message TEXT NOT NULL,
                 score REAL NOT NULL,
-                trace_id TEXT
+                trace_id TEXT,
+                evidence TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_flags_ts ON flags(ts);
             CREATE INDEX IF NOT EXISTS idx_flags_flag ON flags(flag);
@@ -223,11 +243,15 @@ impl Store {
         Ok(())
     }
 
-    pub fn insert_event(&self, event: &Event) -> Result<()> {
+    /// Insert an event. Returns `false` when an alert/flag/decision with the same
+    /// id already exists (content dedupe) so callers can skip re-publishing.
+    pub fn insert_event(&self, event: &Event) -> Result<bool> {
         let kind = kind_name(&event.kind);
         let payload = serde_json::to_string(event)?;
-        self.conn.execute(
-            "INSERT OR REPLACE INTO events (id, ts, source, agent, kind, payload)
+        let mut novel = false;
+
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO events (id, ts, source, agent, kind, payload)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 event.id.to_string(),
@@ -238,6 +262,7 @@ impl Store {
                 payload
             ],
         )?;
+        novel |= n > 0;
 
         match &event.kind {
             EventKind::Classification {
@@ -245,9 +270,10 @@ impl Store {
                 label,
                 confidence,
                 source,
+                ..
             } => {
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO classifications
+                let n = self.conn.execute(
+                    "INSERT OR IGNORE INTO classifications
                      (id, ts, agent, label, confidence, source)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
@@ -259,47 +285,58 @@ impl Store {
                         source
                     ],
                 )?;
+                novel |= n > 0;
             }
             EventKind::Alert {
                 flag,
                 agent,
                 message,
                 score,
+                evidence,
             } => {
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO alerts (id, ts, agent, flag, message, score)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                let evidence_json = serde_json::to_string(evidence).unwrap_or_else(|_| "{}".into());
+                let a = self.conn.execute(
+                    "INSERT OR IGNORE INTO alerts (id, ts, agent, flag, message, score, evidence)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         event.id.to_string(),
                         event.ts.to_rfc3339(),
                         agent,
                         flag.as_str(),
                         message,
-                        score
+                        score,
+                        evidence_json.clone()
                     ],
                 )?;
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO flags (id, ts, agent, flag, message, score, trace_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                let f = self.conn.execute(
+                    "INSERT OR IGNORE INTO flags (id, ts, agent, flag, message, score, trace_id, evidence)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         event.id.to_string(),
                         event.ts.to_rfc3339(),
                         agent,
                         flag.as_str(),
                         message,
-                        score
+                        score,
+                        evidence.trace_id,
+                        evidence_json
                     ],
                 )?;
+                novel |= a > 0 || f > 0;
             }
             EventKind::Span(span) => {
                 self.upsert_span(span)?;
+                novel = true;
             }
             EventKind::PolicyDecision(decision) => {
-                self.insert_policy_decision(event.id, event.ts, decision)?;
+                let n = self.insert_policy_decision(event.id, event.ts, decision)?;
+                novel |= n;
             }
-            _ => {}
+            _ => {
+                novel |= n > 0;
+            }
         }
-        Ok(())
+        Ok(novel)
     }
 
     pub fn upsert_trace(&self, trace: &TraceRecord) -> Result<()> {
@@ -404,22 +441,10 @@ impl Store {
         id: Uuid,
         ts: DateTime<Utc>,
         decision: &PolicyDecision,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO flags (id, ts, agent, flag, message, score, trace_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                id.to_string(),
-                ts.to_rfc3339(),
-                decision.agent,
-                decision.flag.as_str(),
-                decision.reason,
-                decision.score,
-                decision.trace_id,
-            ],
-        )?;
-        self.conn.execute(
-            "INSERT OR REPLACE INTO enforcement_actions
+    ) -> Result<bool> {
+        // Flags come only from Alert events — avoid a second flag row per hit.
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO enforcement_actions
              (id, ts, agent, flag, action, reason, pid, trace_id, enforced)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
@@ -434,7 +459,7 @@ impl Store {
                 decision.enforced as i32,
             ],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
     pub fn get_trace(&self, trace_id: &str) -> Result<Option<TraceTree>> {
@@ -513,7 +538,7 @@ impl Store {
         match (agent, trace_id) {
             (Some(agent), Some(trace_id)) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, ts, agent, flag, message, score, trace_id FROM flags
+                    "SELECT id, ts, agent, flag, message, score, trace_id, evidence FROM flags
                      WHERE agent = ?1 AND trace_id = ?2 ORDER BY ts DESC LIMIT ?3",
                 )?;
                 let rows =
@@ -524,7 +549,7 @@ impl Store {
             }
             (Some(agent), None) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, ts, agent, flag, message, score, trace_id FROM flags
+                    "SELECT id, ts, agent, flag, message, score, trace_id, evidence FROM flags
                      WHERE agent = ?1 ORDER BY ts DESC LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![agent, limit as i64], |row| map_flag_row(row))?;
@@ -534,7 +559,7 @@ impl Store {
             }
             (None, Some(trace_id)) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, ts, agent, flag, message, score, trace_id FROM flags
+                    "SELECT id, ts, agent, flag, message, score, trace_id, evidence FROM flags
                      WHERE trace_id = ?1 ORDER BY ts DESC LIMIT ?2",
                 )?;
                 let rows =
@@ -545,7 +570,7 @@ impl Store {
             }
             (None, None) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, ts, agent, flag, message, score, trace_id FROM flags
+                    "SELECT id, ts, agent, flag, message, score, trace_id, evidence FROM flags
                      ORDER BY ts DESC LIMIT ?1",
                 )?;
                 let rows = stmt.query_map(params![limit as i64], |row| map_flag_row(row))?;
@@ -640,12 +665,24 @@ impl Store {
         Ok(out)
     }
 
+    /// Wipe alerts and security flags (UI "Clear all").
+    pub fn clear_alerts_and_flags(&self) -> Result<(usize, usize)> {
+        let alerts = self.conn.execute("DELETE FROM alerts", [])?;
+        let flags = self.conn.execute("DELETE FROM flags", [])?;
+        let _ = self
+            .conn
+            .execute("DELETE FROM events WHERE kind IN ('alert', 'policy_decision')", [])?;
+        let _ = self.conn.execute("DELETE FROM enforcement_actions", [])?;
+        Ok((alerts, flags))
+    }
+
     pub fn recent_alerts(&self, limit: usize) -> Result<Vec<AlertRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, ts, agent, flag, message, score FROM alerts ORDER BY ts DESC LIMIT ?1",
+            "SELECT id, ts, agent, flag, message, score, evidence FROM alerts ORDER BY ts DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
             let ts: String = row.get(1)?;
+            let evidence_raw: Option<String> = row.get(6)?;
             Ok(AlertRow {
                 id: row.get(0)?,
                 ts: parse_ts(&ts),
@@ -653,6 +690,7 @@ impl Store {
                 flag: row.get(3)?,
                 message: row.get(4)?,
                 score: row.get(5)?,
+                evidence: parse_evidence(evidence_raw),
             })
         })?;
         let mut out = Vec::new();
@@ -776,27 +814,29 @@ impl Store {
         let id = Uuid::new_v4();
         let ts = Utc::now();
         self.conn.execute(
-            "INSERT INTO alerts (id, ts, agent, flag, message, score)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO alerts (id, ts, agent, flag, message, score, evidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 id.to_string(),
                 ts.to_rfc3339(),
                 agent,
                 flag.as_str(),
                 message,
-                score
+                score,
+                "{}"
             ],
         )?;
         self.conn.execute(
-            "INSERT INTO flags (id, ts, agent, flag, message, score, trace_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            "INSERT INTO flags (id, ts, agent, flag, message, score, trace_id, evidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
             params![
                 id.to_string(),
                 ts.to_rfc3339(),
                 agent,
                 flag.as_str(),
                 message,
-                score
+                score,
+                "{}"
             ],
         )?;
         Ok(id)
@@ -807,6 +847,12 @@ fn parse_ts(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+fn parse_evidence(raw: Option<String>) -> RiskEvidence {
+    raw.as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
 }
 
 fn map_trace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TraceRecord> {
@@ -828,6 +874,7 @@ fn map_trace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TraceRecord> {
 
 fn map_flag_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlagRow> {
     let ts: String = row.get(1)?;
+    let evidence_raw: Option<String> = row.get(7)?;
     Ok(FlagRow {
         id: row.get(0)?,
         ts: parse_ts(&ts),
@@ -836,6 +883,7 @@ fn map_flag_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlagRow> {
         message: row.get(4)?,
         score: row.get(5)?,
         trace_id: row.get(6)?,
+        evidence: parse_evidence(evidence_raw),
     })
 }
 

@@ -4,6 +4,30 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Ordered risk rubric (lowest → highest). Score answers are expected level indices.
+const RISK_LEVELS: &[&str] = &["benign", "low", "elevated", "high", "harmful"];
+
+fn behavior_criteria() -> HashMap<String, String> {
+    BehaviorLabel::all()
+        .iter()
+        .map(|l| {
+            let desc = match l {
+                BehaviorLabel::Idle => "no meaningful agent activity",
+                BehaviorLabel::Planning => "reasoning or planning next steps",
+                BehaviorLabel::Coding => "editing or generating source code",
+                BehaviorLabel::Testing => "running tests or verifying behavior",
+                BehaviorLabel::ShellTools => "shell commands and local tooling",
+                BehaviorLabel::Browsing => "web, docs, or remote content access",
+                BehaviorLabel::LlmWait => "waiting on model or API responses",
+                BehaviorLabel::RiskyEgress => {
+                    "suspicious outbound traffic or destructive activity"
+                }
+            };
+            (l.as_str().to_string(), desc.to_string())
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SystemOneRequest {
     pub model: String,
@@ -11,13 +35,14 @@ pub struct SystemOneRequest {
     pub questions: HashMap<String, Question>,
 }
 
+/// System One / llama.cpp `/v1/systemone` question.
+/// `choice` criteria must be a non-empty object; `score` criteria an array of 2–10 levels.
 #[derive(Debug, Clone, Serialize)]
 pub struct Question {
     #[serde(rename = "type")]
     pub qtype: String,
     pub instructions: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub choices: Option<Vec<String>>,
+    pub criteria: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,6 +74,8 @@ pub struct Classification {
     pub confidence: f32,
     pub source: String,
     pub probabilities: HashMap<String, f32>,
+    /// Normalized System-One risk score in `[0, 1]` (expected rubric level / max).
+    pub risk_score: f32,
 }
 
 pub struct SystemOneClient {
@@ -89,10 +116,6 @@ impl SystemOneClient {
     }
 
     pub async fn classify_behavior(&self, state: &str) -> Result<Classification> {
-        let labels: Vec<String> = BehaviorLabel::all()
-            .iter()
-            .map(|l| l.as_str().to_string())
-            .collect();
         let mut questions = HashMap::new();
         questions.insert(
             "behavior".into(),
@@ -100,7 +123,8 @@ impl SystemOneClient {
                 qtype: "choice".into(),
                 instructions: "Classify the primary agent behavior for this monitoring bucket."
                     .into(),
-                choices: Some(labels.clone()),
+                criteria: serde_json::to_value(behavior_criteria())
+                    .expect("behavior criteria serializes"),
             },
         );
         questions.insert(
@@ -108,9 +132,8 @@ impl SystemOneClient {
             Question {
                 qtype: "score".into(),
                 instructions:
-                    "Score security risk from 0 (benign collaboration) to 1 (likely harmful)."
-                        .into(),
-                choices: None,
+                    "Score security risk from benign collaboration to likely harmful.".into(),
+                criteria: serde_json::to_value(RISK_LEVELS).expect("risk criteria serializes"),
             },
         );
 
@@ -151,16 +174,26 @@ impl SystemOneClient {
             probabilities.insert(label.as_str().to_string(), conf);
         }
 
-        // Elevate to risky_egress if risk score high and remotes present in state.
-        let risk = answer
-            .score
-            .or_else(|| {
-                resp.answers
-                    .get("risk")
-                    .and_then(|a| a.score.or(a.confidence))
-            })
+        // Julia returns expected level index in [0, n_levels-1]; normalize to [0, 1].
+        let risk_raw = resp
+            .answers
+            .get("risk")
+            .and_then(|a| a.score.or(a.confidence))
             .unwrap_or(0.0);
-        let label = if risk >= 0.75 && state.contains("egress_score") {
+        let denom = (RISK_LEVELS.len().saturating_sub(1).max(1)) as f32;
+        let risk_score = (risk_raw / denom).clamp(0.0, 1.0);
+        // Only force risky_egress when the state shows meaningful egress, not merely
+        // because the template string always contains the key "egress_score".
+        let egress_high = state
+            .split(';')
+            .find_map(|part| {
+                let p = part.trim();
+                p.strip_prefix("egress_score=")
+                    .and_then(|v| v.parse::<f64>().ok())
+            })
+            .map(|v| v >= 1.0)
+            .unwrap_or(false);
+        let label = if risk_score >= 0.75 && egress_high {
             BehaviorLabel::RiskyEgress
         } else {
             label
@@ -171,6 +204,7 @@ impl SystemOneClient {
             confidence: conf,
             source: "systemone".into(),
             probabilities,
+            risk_score,
         })
     }
 }

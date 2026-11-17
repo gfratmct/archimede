@@ -11,6 +11,8 @@ ml/.venv/
 ml/**/__pycache__/
 ml/**/*.egg-info/
 dist/
+dashboard/dist/
+dashboard/node_modules/
 *.sqlite
 *.sqlite-journal
 *.sqlite-wal
